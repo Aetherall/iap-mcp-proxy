@@ -5,7 +5,7 @@
 
   outputs = { self, nixpkgs }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
       version = self.shortRev or self.dirtyShortRev or "dev";
     in
@@ -18,6 +18,8 @@
           vendorHash = "sha256-+Xqx4zMmJgUF18n7unFSlLcklyTiPx+/YOw+z4Epy/U=";
           subPackages = [ "cmd/iap-mcp-proxy" ];
           env.CGO_ENABLED = "0";
+          # the tests listen on 127.0.0.1, which the macOS sandbox blocks by default
+          __darwinAllowLocalNetworking = true;
           ldflags = [ "-s" "-w" "-X main.version=${version}" ];
           meta = {
             description = "stdio MCP proxy for MCP servers behind Google Cloud IAP";
