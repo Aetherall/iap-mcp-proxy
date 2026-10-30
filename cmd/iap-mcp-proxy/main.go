@@ -18,6 +18,7 @@ import (
 
 	"github.com/knwoop/iap-mcp-proxy/internal/auth"
 	"github.com/knwoop/iap-mcp-proxy/internal/bridge"
+	"github.com/knwoop/iap-mcp-proxy/internal/signin"
 	"github.com/knwoop/iap-mcp-proxy/internal/upstream"
 )
 
@@ -55,7 +56,9 @@ func run() int {
 		upstreamSecret = fs.String("upstream-oauth-client-secret", envOr("IAP_MCP_UPSTREAM_OAUTH_CLIENT_SECRET", ""), "secret of the pre-registered upstream OAuth client, if confidential; supports env:VAR_NAME indirection")
 		upstreamPort   = fs.Int("upstream-oauth-callback-port", 0, "fixed loopback port for the upstream OAuth redirect, when a pre-registered client's redirect URI names one")
 		upstreamScopes = fs.String("upstream-oauth-scopes", envOr("IAP_MCP_UPSTREAM_OAUTH_SCOPES", ""), "comma-separated upstream OAuth scopes; default: the scopes the protected resource advertises")
-		login          = fs.Bool("login", false, "sign in (IAP, then the upstream server with --upstream-oauth) and exit, so a later start needs no browser")
+		login          = fs.Bool("login", false, "sign in (IAP, then the upstream server with --upstream-oauth) and exit, so a later start needs no browser; also accepts the redirect address pasted back from a browser on another machine")
+		noBrowser      = fs.Bool("no-browser", envOr("IAP_MCP_NO_BROWSER", "") == "true", "never open a browser: --login prints the sign-in address and waits for the redirect address to be pasted back; otherwise a needed sign-in fails at once (env IAP_MCP_NO_BROWSER=true)")
+		logout         = fs.Bool("logout", false, "forget the stored upstream OAuth sign-in for UPSTREAM_URL and exit")
 		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry (env IAP_MCP_REFRESH_MARGIN)")
 		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams (env IAP_MCP_TIMEOUT)")
 		logLevel       = fs.String("log-level", envOr("IAP_MCP_LOG", "warn"), "log level: debug, info, warn, error")
@@ -97,6 +100,15 @@ func run() int {
 		return exitConfigError
 	}
 
+	if *logout {
+		if err := upstream.NewSession(upstream.Config{Resource: upstreamURL, Logger: logger}).Logout(); err != nil {
+			fmt.Fprintln(os.Stderr, "iap-mcp-proxy: forgetting the upstream sign-in:", err)
+			return exitFatalError
+		}
+		fmt.Fprintln(os.Stderr, "iap-mcp-proxy: signed out of", upstreamURL)
+		return exitOK
+	}
+
 	mode := *credentials
 	if *impersonateSA != "" && (mode == "auto" || mode == "") {
 		mode = "impersonate"
@@ -132,6 +144,15 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// stdin carries the MCP channel unless only signing in.
+	var interaction signin.Interaction
+	if !*noBrowser && signin.HasBrowser() {
+		interaction.OpenBrowser = signin.OpenBrowser
+	}
+	if *login {
+		interaction.Pasted = signin.Lines(os.Stdin)
+	}
+
 	source, err := auth.NewSource(ctx, auth.Config{
 		Mode:              mode,
 		Audience:          aud,
@@ -139,6 +160,7 @@ func run() int {
 		OAuthClientID:     os.Getenv("IAP_MCP_OAUTH_CLIENT_ID"),
 		OAuthClientSecret: os.Getenv("IAP_MCP_OAUTH_CLIENT_SECRET"),
 		RefreshMargin:     *refreshMargin,
+		SignIn:            interaction,
 		Logger:            logger,
 	})
 	if err != nil {
@@ -157,6 +179,7 @@ func run() int {
 		Source:         source,
 		Audience:       aud,
 		DownstreamAuth: downstream,
+		Origin:         auth.Origin(u),
 		Logger:         logger,
 	}
 	if *upstreamOAuth {
@@ -167,7 +190,7 @@ func run() int {
 			CallbackPort: *upstreamPort,
 			Scopes:       splitList(*upstreamScopes),
 			HTTP:         noRedirectClient(transport),
-			OpenBrowser:  auth.OpenBrowser,
+			SignIn:       interaction,
 			Logger:       logger,
 		})
 		if _, err := session.Token(ctx); err != nil {

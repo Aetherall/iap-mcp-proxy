@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/knwoop/iap-mcp-proxy/internal/iap"
 )
@@ -17,12 +20,29 @@ import (
 // On an IAP auth failure (401, or 302 to accounts.google.com) it
 // refreshes the token once and retries once; a second consecutive
 // failure is returned to the caller.
+//
+// When Origin is set, requests to any other origin (such as a third
+// party authorization server) go out without these credentials.
 type Transport struct {
 	Base           http.RoundTripper
 	Source         *Cached
 	Audience       string
 	DownstreamAuth string
+	Origin         string
 	Logger         *slog.Logger
+}
+
+// Origin returns the scheme://host[:port] of u, without the scheme's
+// default port, the form Transport.Origin expects.
+func Origin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if port := u.Port(); port != "" && !(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host
 }
 
 func (t *Transport) base() http.RoundTripper {
@@ -40,6 +60,10 @@ func (t *Transport) log() *slog.Logger {
 }
 
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.Origin != "" && Origin(req.URL) != t.Origin {
+		return t.base().RoundTrip(req)
+	}
+
 	// Buffer the body so the request can be replayed on retry. MCP
 	// messages are small; this is not a general-purpose proxy body.
 	var body []byte

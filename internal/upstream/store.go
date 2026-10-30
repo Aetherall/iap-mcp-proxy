@@ -15,12 +15,17 @@ import (
 
 const keyringService = "iap-mcp-proxy"
 
+// useKeychain is turned off by tests, so they keep to the file under
+// their own config dir instead of the developer's OS keychain.
+var useKeychain = true
+
 // store persists one resource's credentials in the OS keychain, falling
 // back to a 0600 file when no keychain is available.
 type store struct {
-	key  string
-	path string
-	log  *slog.Logger
+	key      string
+	path     string
+	keychain bool
+	log      *slog.Logger
 }
 
 func newStore(resource string, log *slog.Logger) *store {
@@ -30,14 +35,15 @@ func newStore(resource string, log *slog.Logger) *store {
 		dir = "."
 	}
 	return &store{
-		key:  "upstream-oauth:" + resource,
-		path: filepath.Join(dir, "iap-mcp-proxy", "upstream-oauth-"+hex.EncodeToString(sum[:8])+".json"),
-		log:  log,
+		key:      "upstream-oauth:" + resource,
+		path:     filepath.Join(dir, "iap-mcp-proxy", "upstream-oauth-"+hex.EncodeToString(sum[:8])+".json"),
+		keychain: useKeychain,
+		log:      log,
 	}
 }
 
 func (s *store) load() *storedState {
-	raw, err := keyring.Get(keyringService, s.key)
+	raw, err := s.keychainGet()
 	if err != nil {
 		data, fileErr := os.ReadFile(s.path)
 		if fileErr != nil {
@@ -59,10 +65,15 @@ func (s *store) save(state *storedState) {
 		s.log.Warn("could not encode upstream OAuth credentials", "error", err)
 		return
 	}
-	if err := keyring.Set(keyringService, s.key, string(data)); err == nil {
-		return
-	} else {
-		s.log.Warn("OS keychain unavailable; storing upstream OAuth credentials in a 0600 file instead", "path", s.path, "keychain_error", err)
+	if s.keychain {
+		if err := keyring.Set(keyringService, s.key, string(data)); err == nil {
+			return
+		} else {
+			s.log.Warn("OS keychain unavailable; storing upstream OAuth credentials in a 0600 file instead", "path", s.path, "keychain_error", err)
+		}
+		// load prefers the keychain; drop any older entry there so it
+		// does not shadow the file.
+		_ = keyring.Delete(keyringService, s.key)
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		s.log.Warn("could not store upstream OAuth credentials; you will be asked to sign in again next run", "error", err)
@@ -73,8 +84,18 @@ func (s *store) save(state *storedState) {
 	}
 }
 
+func (s *store) keychainGet() (string, error) {
+	if !s.keychain {
+		return "", keyring.ErrNotFound
+	}
+	return keyring.Get(keyringService, s.key)
+}
+
 func (s *store) delete() error {
-	keyErr := keyring.Delete(keyringService, s.key)
+	var keyErr error
+	if s.keychain {
+		keyErr = keyring.Delete(keyringService, s.key)
+	}
 	if errors.Is(keyErr, keyring.ErrNotFound) {
 		keyErr = nil
 	}

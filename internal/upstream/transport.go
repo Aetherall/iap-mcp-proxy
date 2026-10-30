@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,20 +30,24 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	resp, err := t.send(req, body)
+	resp, token, err := t.send(req, body)
 	if err != nil || !iap.IsApplicationChallenge(resp) {
 		return resp, err
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
-	t.Session.Invalidate()
-	return t.send(req, body)
+	t.Session.Invalidate(token)
+	resp, _, err = t.send(req, body)
+	return resp, err
 }
 
-func (t *Transport) send(req *http.Request, body []byte) (*http.Response, error) {
-	token, err := t.Session.Token(req.Context())
+func (t *Transport) send(req *http.Request, body []byte) (*http.Response, string, error) {
+	// A browser sign-in outlives the request that triggered it: the
+	// bridge cancels requests after --timeout, and the token it yields
+	// serves every later request. The session bounds it on its own.
+	token, err := t.Session.Token(context.WithoutCancel(req.Context()))
 	if err != nil {
-		return nil, fmt.Errorf("signing in to the upstream MCP server: %w", err)
+		return nil, "", fmt.Errorf("signing in to the upstream MCP server: %w", err)
 	}
 	r := req.Clone(req.Context())
 	if body != nil {
@@ -51,5 +56,6 @@ func (t *Transport) send(req *http.Request, body []byte) (*http.Response, error)
 		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
 	}
 	r.Header.Set("Authorization", "Bearer "+token)
-	return t.Base.RoundTrip(r)
+	resp, err := t.Base.RoundTrip(r)
+	return resp, token, err
 }

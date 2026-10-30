@@ -65,6 +65,14 @@ iap-mcp-proxy [flags] <UPSTREAM_URL>
 | `--credentials` | `IAP_MCP_CREDENTIALS` | `auto` | `auto`, `adc`, `impersonate`, `oauth`, `signjwt`. |
 | `--impersonate-service-account` | `IAP_MCP_IMPERSONATE_SA` | — | Target SA email. `impersonate` mints an ID token as it; `signjwt` signs a self-signed JWT as it. |
 | `--downstream-auth` | `IAP_MCP_DOWNSTREAM_AUTH` | — | Value forwarded as the upstream `Authorization` header. Supports `env:VAR_NAME` indirection so secrets stay out of client config files. |
+| `--upstream-oauth` | `IAP_MCP_UPSTREAM_OAUTH=true` | off | Sign in to the MCP server behind IAP with its own OAuth and send that token as `Authorization`. See [Upstream OAuth](#upstream-oauth). Exclusive with `--downstream-auth`. |
+| `--upstream-oauth-client-id` | `IAP_MCP_UPSTREAM_OAUTH_CLIENT_ID` | — | Pre-registered upstream OAuth client. Without it the proxy registers one dynamically. |
+| `--upstream-oauth-client-secret` | `IAP_MCP_UPSTREAM_OAUTH_CLIENT_SECRET` | — | Secret of that client, if confidential. Supports `env:VAR_NAME` indirection. |
+| `--upstream-oauth-callback-port` | — | free port | Fixed loopback port for the OAuth redirect (`http://127.0.0.1:PORT/callback`), when the pre-registered client's redirect URI names one. |
+| `--upstream-oauth-scopes` | `IAP_MCP_UPSTREAM_OAUTH_SCOPES` | advertised scopes | Comma-separated scopes to request. |
+| `--login` | — | — | Sign in (IAP, then the upstream with `--upstream-oauth`) and exit, so later starts need no browser. Also accepts the redirect address pasted back from a browser on another machine; see [Signing in without a browser](#signing-in-without-a-browser). |
+| `--no-browser` | `IAP_MCP_NO_BROWSER=true` | auto-detected | Never open a browser. `--login` prints the sign-in address and waits for the redirect to be pasted back; otherwise a needed sign-in fails at once. |
+| `--logout` | — | — | Forget the stored upstream OAuth sign-in for `UPSTREAM_URL` and exit. |
 | `--refresh-margin` | `IAP_MCP_REFRESH_MARGIN` | `5m` | Refresh the ID token this long before expiry. |
 | `--timeout` | `IAP_MCP_TIMEOUT` | `120s` | Upstream timeout: total for JSON responses, idle (time between reads) for SSE streams — so long-running streaming tool calls are not killed while data or keepalives keep arriving. |
 | `--log-level` | `IAP_MCP_LOG` | `warn` | `debug` / `info` / `warn` / `error`. Logs go to stderr only. |
@@ -81,6 +89,22 @@ With `--credentials=auto` (the default), sources are tried in this order:
 These OIDC modes need IAP to use a **custom** OAuth client (LB-backed IAP, or a managed-client service with a separate allow-listed OAuth client). For modern managed-client direct Cloud Run IAP, `--credentials=signjwt` is the simplest route — it needs no OAuth client (see [Supported IAP configurations](#supported-iap-configurations)).
 
 The principal must hold `roles/iap.httpsResourceAccessor` on the IAP resource.
+
+## Upstream OAuth
+
+Some MCP servers behind IAP require their own OAuth sign-in (GitLab's `/api/v4/mcp`, for instance). MCP clients cannot do it themselves, because discovery and token requests must also get through IAP. With `--upstream-oauth` the proxy follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization): protected resource metadata, authorization server metadata, dynamic client registration (unless `--upstream-oauth-client-id` is set), then a browser sign-in with PKCE. IAP gets its token in `Proxy-Authorization` and the application gets its own in `Authorization`. Credentials are stored in your OS keychain (fallback: `0600` file under your user config dir) and refreshed as needed. The IAP token is only sent to the upstream's origin, never to an authorization server hosted elsewhere.
+
+### Signing in without a browser
+
+The browser sign-ins (upstream OAuth, and `--credentials=oauth` for IAP) redirect to a listener on `127.0.0.1`. On a machine with no browser (over SSH without a forwarded display, or a Unix without a display), run the sign-in once in a terminal:
+
+```
+iap-mcp-proxy --login [same flags] <UPSTREAM_URL>
+```
+
+Open the printed address in a browser on any machine and sign in. The browser then lands on a `127.0.0.1` address that fails to load; paste that address into the terminal. Alternatively, fix the port with `--upstream-oauth-callback-port` and forward it with `ssh -L PORT:127.0.0.1:PORT`, so the redirect reaches the proxy directly.
+
+When the proxy runs under an MCP client and a sign-in is needed with no browser available, it fails at once and asks for `--login`, rather than waiting on a browser that will never open.
 
 ## Supported IAP configurations
 

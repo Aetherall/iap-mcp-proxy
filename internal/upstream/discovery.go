@@ -52,7 +52,7 @@ func discover(ctx context.Context, client *http.Client, resourceURL string) (*pr
 // describes this resource.
 func fetchProtectedResource(ctx context.Context, client *http.Client, resourceURL string) (*protectedResource, error) {
 	var lastErr error
-	for _, candidate := range wellKnownURLs(resourceURL, "oauth-protected-resource") {
+	for _, candidate := range protectedResourceURLs(resourceURL) {
 		var resource protectedResource
 		if err := getJSON(ctx, client, candidate, &resource); err != nil {
 			lastErr = err
@@ -66,27 +66,51 @@ func fetchProtectedResource(ctx context.Context, client *http.Client, resourceUR
 	return nil, fmt.Errorf("no protected resource metadata: %w", lastErr)
 }
 
+// fetchAuthorizationServer tries the metadata locations the MCP
+// authorization spec lists for this issuer, skipping documents that
+// name another issuer.
 func fetchAuthorizationServer(ctx context.Context, client *http.Client, issuer string) (*authorizationServer, error) {
 	var lastErr error
-	candidates := append(wellKnownURLs(issuer, "oauth-authorization-server"), wellKnownURLs(issuer, "openid-configuration")...)
-	candidates = append(candidates, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration")
-	for _, candidate := range candidates {
+	for _, candidate := range authorizationServerURLs(issuer) {
 		var server authorizationServer
 		if err := getJSON(ctx, client, candidate, &server); err != nil {
 			lastErr = err
 			continue
 		}
 		if strings.TrimSuffix(server.Issuer, "/") != strings.TrimSuffix(issuer, "/") {
-			return nil, fmt.Errorf("authorization server metadata at %s names issuer %q, not %s", candidate, server.Issuer, issuer)
+			lastErr = fmt.Errorf("authorization server metadata at %s names issuer %q, not %s", candidate, server.Issuer, issuer)
+			continue
 		}
 		return &server, nil
 	}
 	return nil, fmt.Errorf("no authorization server metadata for %s: %w", issuer, lastErr)
 }
 
-// wellKnownURLs inserts /.well-known/<name> between the origin and the
-// path (RFC 8414 section 3.1), then falls back to the origin alone.
-func wellKnownURLs(rawURL, name string) []string {
+// authorizationServerURLs inserts the RFC 8414 and OpenID Connect
+// well-known names between the issuer's origin and path, then appends
+// the OpenID Connect one to the path. An issuer with a path never falls
+// back to its origin's metadata, which describes another issuer.
+func authorizationServerURLs(issuer string) []string {
+	u, err := url.Parse(issuer)
+	if err != nil {
+		return nil
+	}
+	origin := u.Scheme + "://" + u.Host
+	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	if path == "" {
+		return []string{origin + "/.well-known/oauth-authorization-server", origin + "/.well-known/openid-configuration"}
+	}
+	return []string{
+		origin + "/.well-known/oauth-authorization-server" + path,
+		origin + "/.well-known/openid-configuration" + path,
+		origin + path + "/.well-known/openid-configuration",
+	}
+}
+
+// protectedResourceURLs inserts /.well-known/oauth-protected-resource
+// between the origin and the path (RFC 9728 section 3.1), then falls
+// back to the origin alone.
+func protectedResourceURLs(rawURL string) []string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil
@@ -94,9 +118,9 @@ func wellKnownURLs(rawURL, name string) []string {
 	origin := u.Scheme + "://" + u.Host
 	path := strings.TrimSuffix(u.EscapedPath(), "/")
 	if path == "" {
-		return []string{origin + "/.well-known/" + name}
+		return []string{origin + "/.well-known/oauth-protected-resource"}
 	}
-	return []string{origin + "/.well-known/" + name + path, origin + "/.well-known/" + name}
+	return []string{origin + "/.well-known/oauth-protected-resource" + path, origin + "/.well-known/oauth-protected-resource"}
 }
 
 // describes reports whether metadata naming resource applies to

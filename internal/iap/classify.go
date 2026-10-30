@@ -30,7 +30,7 @@ func IsIAPResponse(resp *http.Response) bool {
 func IsAuthFailure(resp *http.Response) bool {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
-		return IsIAPResponse(resp) || !IsApplicationChallenge(resp)
+		return !IsApplicationChallenge(resp)
 	case http.StatusFound, http.StatusMovedPermanently, http.StatusSeeOther, http.StatusTemporaryRedirect:
 		return isGoogleSignInRedirect(resp)
 	}

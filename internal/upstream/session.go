@@ -10,21 +10,28 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/knwoop/iap-mcp-proxy/internal/signin"
 	"golang.org/x/oauth2"
 )
 
-// OpenBrowser opens a URL in the user's browser, best effort.
-type OpenBrowser func(url string)
+const (
+	// signInTimeout bounds a whole sign-in, browser included.
+	signInTimeout = 5 * time.Minute
+	// refreshTimeout bounds a refresh, which holds the session lock.
+	refreshTimeout = 30 * time.Second
+)
 
 // Config configures the sign-in to one upstream MCP server.
 type Config struct {
@@ -44,9 +51,10 @@ type Config struct {
 	ClientName string
 	// HTTP sends discovery, registration and token requests; it must go
 	// through IAP.
-	HTTP        *http.Client
-	OpenBrowser OpenBrowser
-	Logger      *slog.Logger
+	HTTP *http.Client
+	// SignIn is how the browser sign-in reaches the user.
+	SignIn signin.Interaction
+	Logger *slog.Logger
 }
 
 // Session holds the upstream OAuth credentials for one resource and
@@ -62,6 +70,7 @@ type Session struct {
 
 // storedState is what a sign-in leaves behind: enough to refresh the
 // token without discovery, and to sign in again with the same client.
+// Resource is the identifier the protected resource metadata declares.
 type storedState struct {
 	Resource              string        `json:"resource"`
 	AuthorizationEndpoint string        `json:"authorization_endpoint"`
@@ -109,12 +118,13 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 	return s.state.Token.AccessToken, nil
 }
 
-// Invalidate marks the current access token expired, so the next Token
-// call refreshes it. Used after the upstream rejects it.
-func (s *Session) Invalidate() {
+// Invalidate marks the access token rejected by the upstream expired,
+// so the next Token call refreshes it. A token already replaced by a
+// concurrent refresh is left alone.
+func (s *Session) Invalidate(rejected string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.state != nil && s.state.Token != nil {
+	if s.state != nil && s.state.Token != nil && s.state.Token.AccessToken == rejected {
 		s.state.Token.Expiry = time.Unix(1, 0)
 	}
 }
@@ -153,15 +163,58 @@ func (s *Session) httpContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, oauth2.HTTPClient, s.cfg.HTTP)
 }
 
+// refresh redeems the refresh token by hand rather than through
+// oauth2.TokenSource, which cannot send the resource parameter the MCP
+// authorization spec requires on every token request.
 func (s *Session) refresh(ctx context.Context) error {
 	if s.state.Token.RefreshToken == "" {
 		return errors.New("no refresh token")
 	}
-	stale := *s.state.Token
-	stale.Expiry = time.Unix(1, 0)
-	tok, err := s.oauthConfig().TokenSource(s.httpContext(ctx), &stale).Token()
+	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
+	cfg := s.oauthConfig()
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {s.state.Token.RefreshToken},
+		"resource":      {s.state.Resource},
+	}
+	if cfg.ClientSecret == "" {
+		form.Set("client_id", cfg.ClientID)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.Endpoint.TokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	if cfg.ClientSecret != "" {
+		req.SetBasicAuth(url.QueryEscape(cfg.ClientID), url.QueryEscape(cfg.ClientSecret))
+	}
+	resp, err := s.cfg.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var body struct {
+		AccessToken      string `json:"access_token"`
+		TokenType        string `json:"token_type"`
+		RefreshToken     string `json:"refresh_token"`
+		ExpiresIn        int64  `json:"expires_in"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return fmt.Errorf("refreshing the token: HTTP %d: %w", resp.StatusCode, err)
+	}
+	if resp.StatusCode != http.StatusOK || body.AccessToken == "" {
+		return fmt.Errorf("refreshing the token: HTTP %d: %s %s", resp.StatusCode, body.Error, body.ErrorDescription)
+	}
+	tok := &oauth2.Token{AccessToken: body.AccessToken, TokenType: body.TokenType, RefreshToken: body.RefreshToken}
+	if tok.RefreshToken == "" {
+		tok.RefreshToken = s.state.Token.RefreshToken
+	}
+	if body.ExpiresIn > 0 {
+		tok.Expiry = time.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
 	}
 	s.state.Token = tok
 	s.store.save(s.state)
@@ -169,6 +222,11 @@ func (s *Session) refresh(ctx context.Context) error {
 }
 
 func (s *Session) signIn(ctx context.Context) error {
+	if err := s.cfg.SignIn.Available(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeoutCause(ctx, signInTimeout, errors.New("timed out waiting for browser sign-in"))
+	defer cancel()
 	resource, server, err := discover(ctx, s.cfg.HTTP, s.cfg.Resource)
 	if err != nil {
 		return fmt.Errorf("discovering how to sign in to %s: %w", s.cfg.Resource, err)
@@ -185,7 +243,7 @@ func (s *Session) signIn(ctx context.Context) error {
 	defer listener.Close()
 
 	state := &storedState{
-		Resource:              s.cfg.Resource,
+		Resource:              resource.Resource,
 		AuthorizationEndpoint: server.AuthorizationEndpoint,
 		TokenEndpoint:         server.TokenEndpoint,
 		Scopes:                scopes,
@@ -246,15 +304,10 @@ func (s *Session) authorize(ctx context.Context, listener net.Listener) (*oauth2
 	cfg := s.oauthConfig()
 	state := oauth2.GenerateVerifier()
 	verifier := oauth2.GenerateVerifier()
-	resourceParam := oauth2.SetAuthURLParam("resource", s.cfg.Resource)
+	resourceParam := oauth2.SetAuthURLParam("resource", s.state.Resource)
 	authURL := cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier), resourceParam)
 
-	code, err := waitForCode(ctx, listener, state, func() {
-		fmt.Fprintf(os.Stderr, "iap-mcp-proxy: opening browser to sign in to %s.\nIf it does not open, visit:\n%s\n", s.cfg.Resource, authURL)
-		if s.cfg.OpenBrowser != nil {
-			s.cfg.OpenBrowser(authURL)
-		}
-	})
+	code, err := s.cfg.SignIn.WaitForCode(ctx, listener, authURL, state, s.cfg.Resource)
 	if err != nil {
 		return nil, err
 	}
@@ -263,47 +316,6 @@ func (s *Session) authorize(ctx context.Context, listener net.Listener) (*oauth2
 		return nil, fmt.Errorf("exchanging authorization code: %w", err)
 	}
 	return tok, nil
-}
-
-func waitForCode(ctx context.Context, listener net.Listener, state string, open func()) (string, error) {
-	codes := make(chan string, 1)
-	failures := make(chan error, 1)
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/callback" {
-			http.NotFound(w, r)
-			return
-		}
-		query := r.URL.Query()
-		if query.Get("state") != state {
-			http.Error(w, "state mismatch", http.StatusBadRequest)
-			return
-		}
-		if reason := query.Get("error"); reason != "" {
-			fmt.Fprintf(w, "Sign-in failed: %s. You can close this window.", reason)
-			failures <- fmt.Errorf("authorization failed: %s %s", reason, query.Get("error_description"))
-			return
-		}
-		fmt.Fprint(w, "Signed in. You can close this window and return to your MCP client.")
-		codes <- query.Get("code")
-	})}
-	go server.Serve(listener)
-	defer func() {
-		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		server.Shutdown(shutdown)
-	}()
-
-	open()
-	select {
-	case code := <-codes:
-		return code, nil
-	case err := <-failures:
-		return "", err
-	case <-time.After(5 * time.Minute):
-		return "", errors.New("timed out waiting for browser sign-in")
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
 }
 
 func loopbackPort(redirectURI string) int {

@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"time"
 
+	"github.com/knwoop/iap-mcp-proxy/internal/signin"
 	"github.com/zalando/go-keyring"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -29,8 +27,9 @@ const keyringService = "iap-mcp-proxy"
 // project as the IAP resource; see
 // https://cloud.google.com/iap/docs/authentication-howto
 type oauthSource struct {
-	cfg *oauth2.Config
-	log *slog.Logger
+	cfg    *oauth2.Config
+	signIn signin.Interaction
+	log    *slog.Logger
 }
 
 func newOAuthSource(ctx context.Context, c Config) (Source, error) {
@@ -48,7 +47,8 @@ func newOAuthSource(ctx context.Context, c Config) (Source, error) {
 			Endpoint:     google.Endpoint,
 			Scopes:       []string{"openid", "email"},
 		},
-		log: log,
+		signIn: c.SignIn,
+		log:    log,
 	}, nil
 }
 
@@ -88,6 +88,8 @@ func (s *oauthSource) idTokenFromRefresh(ctx context.Context, refreshToken strin
 // browserFlow runs the interactive installed-app flow: local callback
 // listener, browser launch, code exchange (with PKCE).
 func (s *oauthSource) browserFlow(ctx context.Context) (refreshToken, idToken string, err error) {
+	ctx, cancel := context.WithTimeoutCause(ctx, 5*time.Minute, errors.New("timed out waiting for browser sign-in"))
+	defer cancel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", "", fmt.Errorf("starting OAuth callback listener: %w", err)
@@ -109,43 +111,10 @@ func (s *oauthSource) browserFlow(ctx context.Context) (refreshToken, idToken st
 		oauth2.SetAuthURLParam("prompt", "consent"),
 	)
 
-	codeCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/callback" {
-			http.NotFound(w, r)
-			return
-		}
-		q := r.URL.Query()
-		if q.Get("state") != state {
-			errCh <- errors.New("OAuth callback state mismatch")
-			http.Error(w, "state mismatch", http.StatusBadRequest)
-			return
-		}
-		if e := q.Get("error"); e != "" {
-			errCh <- fmt.Errorf("authorization failed: %s", e)
-			fmt.Fprintf(w, "Sign-in failed: %s. You can close this window.", e)
-			return
-		}
-		codeCh <- q.Get("code")
-		fmt.Fprint(w, "Signed in. You can close this window and return to your MCP client.")
-	})}
-	go srv.Serve(ln)
-	defer srv.Close()
-
-	s.log.Info("opening browser for Google sign-in", "url", authURL)
-	fmt.Fprintf(os.Stderr, "iap-mcp-proxy: opening browser for Google sign-in.\nIf it does not open, visit:\n%s\n", authURL)
-	OpenBrowser(authURL)
-
-	var code string
-	select {
-	case code = <-codeCh:
-	case err := <-errCh:
+	s.log.Info("starting Google sign-in", "url", authURL)
+	code, err := s.signIn.WaitForCode(ctx, ln, authURL, state, "Google for IAP")
+	if err != nil {
 		return "", "", err
-	case <-time.After(5 * time.Minute):
-		return "", "", errors.New("timed out waiting for browser sign-in")
-	case <-ctx.Done():
-		return "", "", ctx.Err()
 	}
 
 	tok, err := cfg.Exchange(ctx, code, oauth2.VerifierOption(verifier))
@@ -204,18 +173,4 @@ func (s *oauthSource) fallbackPath() string {
 		dir = "."
 	}
 	return filepath.Join(dir, "iap-mcp-proxy", "refresh-token-"+s.cfg.ClientID)
-}
-
-// OpenBrowser opens url in the default browser, best effort.
-func OpenBrowser(url string) {
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "darwin":
-		cmd = exec.Command("open", url)
-	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	default:
-		cmd = exec.Command("xdg-open", url)
-	}
-	_ = cmd.Start()
 }

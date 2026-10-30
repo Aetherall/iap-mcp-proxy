@@ -1,15 +1,19 @@
 package upstream
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
+
+	"github.com/knwoop/iap-mcp-proxy/internal/signin"
 )
 
 // fakeServer plays an MCP server that is also its own OAuth
@@ -80,7 +84,7 @@ func newFakeServer(t *testing.T) *fakeServer {
 			f.issued["access-1"] = true
 			writeJSON(w, http.StatusOK, map[string]any{"access_token": "access-1", "token_type": "Bearer", "refresh_token": "refresh-1", "expires_in": 3600})
 		case "refresh_token":
-			if r.Form.Get("refresh_token") != "refresh-1" {
+			if r.Form.Get("refresh_token") != "refresh-1" || r.Form.Get("resource") != f.URL+"/mcp" || r.Form.Get("client_id") != "client-1" {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
 				return
 			}
@@ -112,6 +116,12 @@ func (f *fakeServer) revoke() {
 	f.issued = map[string]bool{}
 }
 
+func (f *fakeServer) snapshot() (registrations []map[string]any, refreshed int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]any(nil), f.registrations...), f.refreshed
+}
+
 func trimBearer(header string) string {
 	if len(header) > len("Bearer ") {
 		return header[len("Bearer "):]
@@ -127,8 +137,8 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 // followInBrowser plays the user's browser: it follows the
 // authorization redirect back to the loopback callback.
-func followInBrowser(t *testing.T) OpenBrowser {
-	return func(authorizationURL string) {
+func followInBrowser(t *testing.T) signin.Interaction {
+	return signin.Interaction{OpenBrowser: func(authorizationURL string) {
 		go func() {
 			resp, err := http.Get(authorizationURL)
 			if err != nil {
@@ -137,19 +147,21 @@ func followInBrowser(t *testing.T) OpenBrowser {
 			}
 			resp.Body.Close()
 		}()
-	}
+	}}
 }
 
 func setup(t *testing.T) *fakeServer {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	useKeychain = false
+	t.Cleanup(func() { useKeychain = true })
 	return newFakeServer(t)
 }
 
 func newTestSession(t *testing.T, server *fakeServer) *Session {
 	session := NewSession(Config{
-		Resource:    server.URL + "/mcp",
-		HTTP:        server.Client(),
-		OpenBrowser: followInBrowser(t),
+		Resource: server.URL + "/mcp",
+		HTTP:     server.Client(),
+		SignIn:   followInBrowser(t),
 	})
 	t.Cleanup(func() { session.Logout() })
 	return session
@@ -172,10 +184,11 @@ func TestSignsInThroughDiscoveryAndRegistration(t *testing.T) {
 	if status := get(t, client, server.URL+"/mcp"); status != http.StatusOK {
 		t.Fatalf("MCP request after sign-in: HTTP %d, want 200", status)
 	}
-	if len(server.registrations) != 1 {
-		t.Fatalf("registrations = %d, want 1", len(server.registrations))
+	registrations, _ := server.snapshot()
+	if len(registrations) != 1 {
+		t.Fatalf("registrations = %d, want 1", len(registrations))
 	}
-	registration := server.registrations[0]
+	registration := registrations[0]
 	if registration["token_endpoint_auth_method"] != "none" || registration["scope"] != "mcp" {
 		t.Errorf("registration = %v, want a public client asking for scope mcp", registration)
 	}
@@ -192,8 +205,8 @@ func TestRetriesWithARefreshedTokenWhenTheServerRejectsIt(t *testing.T) {
 	if status := get(t, client, server.URL+"/mcp"); status != http.StatusOK {
 		t.Fatalf("MCP request after revocation: HTTP %d, want 200", status)
 	}
-	if server.refreshed != 1 {
-		t.Errorf("refreshes = %d, want 1", server.refreshed)
+	if _, refreshed := server.snapshot(); refreshed != 1 {
+		t.Errorf("refreshes = %d, want 1", refreshed)
 	}
 }
 
@@ -201,12 +214,72 @@ func TestReusesStoredCredentialsInANewSession(t *testing.T) {
 	server := setup(t)
 	newTestSession(t, server).Token(t.Context())
 
-	restarted := NewSession(Config{Resource: server.URL + "/mcp", HTTP: server.Client(), OpenBrowser: func(string) {
-		t.Error("a restarted session asked for a browser sign-in")
-	}})
+	restarted := NewSession(Config{Resource: server.URL + "/mcp", HTTP: server.Client()})
 	token, err := restarted.Token(t.Context())
 
 	if err != nil || token != "access-1" {
 		t.Fatalf("restarted session token = %q, %v; want access-1 from the store", token, err)
+	}
+}
+
+func TestKeepsATokenAnotherRequestAlreadyRefreshed(t *testing.T) {
+	server := setup(t)
+	session := newTestSession(t, server)
+	session.Token(t.Context())
+
+	session.Invalidate("a-token-replaced-since")
+	token, err := session.Token(t.Context())
+
+	if _, refreshed := server.snapshot(); err != nil || token != "access-1" || refreshed != 0 {
+		t.Fatalf("token = %q, %v after %d refreshes; want access-1 kept", token, err, refreshed)
+	}
+}
+
+func TestFindsAnIssuerWithAPathPastItsOriginsMetadata(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"issuer": server.URL})
+	})
+	mux.HandleFunc("/realms/team/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"issuer": server.URL + "/realms/team", "token_endpoint": server.URL + "/realms/team/token"})
+	})
+
+	found, err := fetchAuthorizationServer(t.Context(), server.Client(), server.URL+"/realms/team")
+
+	if err != nil || found.TokenEndpoint != server.URL+"/realms/team/token" {
+		t.Fatalf("authorization server = %+v, %v; want the realm's metadata", found, err)
+	}
+}
+
+func TestSignInOutlivesTheRequestThatStartedIt(t *testing.T) {
+	server := setup(t)
+	session := newTestSession(t, server)
+	client := &http.Client{Transport: &Transport{Base: server.Client().Transport, Session: session}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/mcp", nil)
+
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+	}
+
+	session.mu.Lock()
+	signedIn := session.state != nil && session.state.Token != nil
+	session.mu.Unlock()
+	if !signedIn {
+		t.Fatal("the sign-in a canceled request started was abandoned")
+	}
+}
+
+func TestFailsAtOnceWithoutAWayToSignIn(t *testing.T) {
+	server := setup(t)
+	session := NewSession(Config{Resource: server.URL + "/mcp", HTTP: server.Client()})
+
+	_, err := session.Token(t.Context())
+
+	if registrations, _ := server.snapshot(); !errors.Is(err, signin.ErrNoBrowser) || len(registrations) != 0 {
+		t.Fatalf("Token = %v after %d registrations; want ErrNoBrowser before registering", err, len(registrations))
 	}
 }

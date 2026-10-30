@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,34 @@ func TestTransportSetsHeaders(t *testing.T) {
 	}
 	if gotAuth != "Bearer app-token" {
 		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestTransportKeepsCredentialsToItsOrigin(t *testing.T) {
+	var gotProxy, gotAuth string
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotProxy = r.Header.Get("Proxy-Authorization")
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	defer other.Close()
+
+	cached, fake := newTestCached(t)
+	client := &http.Client{Transport: &Transport{Source: cached, DownstreamAuth: "Bearer app-token", Origin: "https://upstream.example.com"}}
+	resp, err := client.Get(other.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if gotProxy != "" || gotAuth != "" || fake.calls != 0 {
+		t.Errorf("request to another origin carried Proxy-Authorization %q, Authorization %q (%d token mints)", gotProxy, gotAuth, fake.calls)
+	}
+}
+
+func TestOriginDropsTheDefaultPort(t *testing.T) {
+	u, _ := url.Parse("HTTPS://Upstream.example.com:443/mcp")
+	if got := Origin(u); got != "https://upstream.example.com" {
+		t.Errorf("Origin = %q", got)
 	}
 }
 

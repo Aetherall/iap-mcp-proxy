@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/knwoop/iap-mcp-proxy/internal/signin"
 )
 
 // Source mints a raw bearer token (OIDC ID token or self-signed SA JWT)
@@ -39,6 +41,8 @@ type Config struct {
 	OAuthClientSecret string
 	// RefreshMargin is how long before expiry a cached token is refreshed.
 	RefreshMargin time.Duration
+	// SignIn is how the oauth mode's browser sign-in reaches the user.
+	SignIn signin.Interaction
 
 	Logger *slog.Logger
 }
