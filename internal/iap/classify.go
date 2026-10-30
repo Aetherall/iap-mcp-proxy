@@ -23,15 +23,29 @@ func IsIAPResponse(resp *http.Response) bool {
 
 // IsAuthFailure reports whether the response is an IAP authentication
 // failure: a 401, or a 302 redirect into the Google sign-in flow (which
-// IAP issues when the token is absent or malformed).
+// IAP issues when the token is absent or malformed). A 401 the upstream
+// application issued with its own Bearer challenge is not one: it asks
+// for the application's credentials, which refreshing the IAP token
+// cannot fix.
 func IsAuthFailure(resp *http.Response) bool {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
-		return true
+		return IsIAPResponse(resp) || !IsApplicationChallenge(resp)
 	case http.StatusFound, http.StatusMovedPermanently, http.StatusSeeOther, http.StatusTemporaryRedirect:
 		return isGoogleSignInRedirect(resp)
 	}
 	return false
+}
+
+// IsApplicationChallenge reports whether the upstream application, not
+// IAP, rejected the request and asked for its own Bearer credentials
+// (RFC 6750), as an MCP server protected by OAuth does.
+func IsApplicationChallenge(resp *http.Response) bool {
+	if resp.StatusCode != http.StatusUnauthorized || IsIAPResponse(resp) {
+		return false
+	}
+	scheme, _, _ := strings.Cut(strings.TrimSpace(resp.Header.Get("WWW-Authenticate")), " ")
+	return strings.EqualFold(scheme, "Bearer")
 }
 
 func isGoogleSignInRedirect(resp *http.Response) bool {

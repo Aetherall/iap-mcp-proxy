@@ -135,7 +135,7 @@ func (s *oauthSource) browserFlow(ctx context.Context) (refreshToken, idToken st
 
 	s.log.Info("opening browser for Google sign-in", "url", authURL)
 	fmt.Fprintf(os.Stderr, "iap-mcp-proxy: opening browser for Google sign-in.\nIf it does not open, visit:\n%s\n", authURL)
-	openBrowser(authURL)
+	OpenBrowser(authURL)
 
 	var code string
 	select {
@@ -206,7 +206,8 @@ func (s *oauthSource) fallbackPath() string {
 	return filepath.Join(dir, "iap-mcp-proxy", "refresh-token-"+s.cfg.ClientID)
 }
 
-func openBrowser(url string) {
+// OpenBrowser opens url in the default browser, best effort.
+func OpenBrowser(url string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":

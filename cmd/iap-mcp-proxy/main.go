@@ -18,6 +18,7 @@ import (
 
 	"github.com/knwoop/iap-mcp-proxy/internal/auth"
 	"github.com/knwoop/iap-mcp-proxy/internal/bridge"
+	"github.com/knwoop/iap-mcp-proxy/internal/upstream"
 )
 
 // version is set via -ldflags at release time.
@@ -49,6 +50,12 @@ func run() int {
 		credentials    = fs.String("credentials", envOr("IAP_MCP_CREDENTIALS", "auto"), "credential source: auto, adc, impersonate, oauth, signjwt")
 		impersonateSA  = fs.String("impersonate-service-account", envOr("IAP_MCP_IMPERSONATE_SA", ""), "target service account email (impersonate mode signs an ID token; signjwt mode signs a self-signed JWT)")
 		downstreamAuth = fs.String("downstream-auth", envOr("IAP_MCP_DOWNSTREAM_AUTH", ""), "value forwarded as the upstream Authorization header; supports env:VAR_NAME indirection")
+		upstreamOAuth  = fs.Bool("upstream-oauth", envOr("IAP_MCP_UPSTREAM_OAUTH", "") == "true", "sign in to the upstream MCP server with its own OAuth (discovered from its protected resource metadata) and send that token as Authorization (env IAP_MCP_UPSTREAM_OAUTH=true)")
+		upstreamID     = fs.String("upstream-oauth-client-id", envOr("IAP_MCP_UPSTREAM_OAUTH_CLIENT_ID", ""), "pre-registered upstream OAuth client ID; without it the proxy registers a client dynamically")
+		upstreamSecret = fs.String("upstream-oauth-client-secret", envOr("IAP_MCP_UPSTREAM_OAUTH_CLIENT_SECRET", ""), "secret of the pre-registered upstream OAuth client, if confidential; supports env:VAR_NAME indirection")
+		upstreamPort   = fs.Int("upstream-oauth-callback-port", 0, "fixed loopback port for the upstream OAuth redirect, when a pre-registered client's redirect URI names one")
+		upstreamScopes = fs.String("upstream-oauth-scopes", envOr("IAP_MCP_UPSTREAM_OAUTH_SCOPES", ""), "comma-separated upstream OAuth scopes; default: the scopes the protected resource advertises")
+		login          = fs.Bool("login", false, "sign in (IAP, then the upstream server with --upstream-oauth) and exit, so a later start needs no browser")
 		refreshMargin  = fs.Duration("refresh-margin", 5*time.Minute, "refresh the ID token this long before expiry (env IAP_MCP_REFRESH_MARGIN)")
 		timeout        = fs.Duration("timeout", 120*time.Second, "upstream timeout: total for JSON responses, idle (between reads) for SSE streams (env IAP_MCP_TIMEOUT)")
 		logLevel       = fs.String("log-level", envOr("IAP_MCP_LOG", "warn"), "log level: debug, info, warn, error")
@@ -83,10 +90,10 @@ func run() int {
 		return exitConfigError
 	}
 
-	upstream := fs.Arg(0)
-	u, err := url.Parse(upstream)
+	upstreamURL := fs.Arg(0)
+	u, err := url.Parse(upstreamURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		fmt.Fprintf(os.Stderr, "iap-mcp-proxy: invalid upstream URL %q (want e.g. https://my-mcp-xxxx.a.run.app/mcp)\n", upstream)
+		fmt.Fprintf(os.Stderr, "iap-mcp-proxy: invalid upstream URL %q (want e.g. https://my-mcp-xxxx.a.run.app/mcp)\n", upstreamURL)
 		return exitConfigError
 	}
 
@@ -107,9 +114,18 @@ func run() int {
 		logger.Info("no --audience given; derived from upstream URL", "mode", mode, "audience", aud)
 	}
 
-	downstream, err := resolveDownstreamAuth(*downstreamAuth)
+	downstream, err := resolveEnvIndirection("--downstream-auth", *downstreamAuth)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iap-mcp-proxy:", err)
+		return exitConfigError
+	}
+	upstreamClientSecret, err := resolveEnvIndirection("--upstream-oauth-client-secret", *upstreamSecret)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iap-mcp-proxy:", err)
+		return exitConfigError
+	}
+	if *upstreamOAuth && downstream != "" {
+		fmt.Fprintln(os.Stderr, "iap-mcp-proxy: --upstream-oauth and --downstream-auth both set the upstream Authorization header; use one")
 		return exitConfigError
 	}
 
@@ -137,22 +153,37 @@ func run() int {
 		return exitAuthError
 	}
 
-	client := &http.Client{
-		Transport: &auth.Transport{
-			Source:         source,
-			Audience:       aud,
-			DownstreamAuth: downstream,
-			Logger:         logger,
-		},
-		// Never follow redirects: a 302 to accounts.google.com is an
-		// auth failure signal, not a path to follow.
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	var transport http.RoundTripper = &auth.Transport{
+		Source:         source,
+		Audience:       aud,
+		DownstreamAuth: downstream,
+		Logger:         logger,
 	}
+	if *upstreamOAuth {
+		session := upstream.NewSession(upstream.Config{
+			Resource:     upstreamURL,
+			ClientID:     *upstreamID,
+			ClientSecret: upstreamClientSecret,
+			CallbackPort: *upstreamPort,
+			Scopes:       splitList(*upstreamScopes),
+			HTTP:         noRedirectClient(transport),
+			OpenBrowser:  auth.OpenBrowser,
+			Logger:       logger,
+		})
+		if _, err := session.Token(ctx); err != nil {
+			fmt.Fprintln(os.Stderr, "iap-mcp-proxy: upstream sign-in failed:", err)
+			return exitAuthError
+		}
+		transport = &upstream.Transport{Base: transport, Session: session}
+	}
+	if *login {
+		fmt.Fprintln(os.Stderr, "iap-mcp-proxy: signed in")
+		return exitOK
+	}
+	client := noRedirectClient(transport)
 
 	b := &bridge.Bridge{
-		Upstream: upstream,
+		Upstream: upstreamURL,
 		Client:   client,
 		Timeout:  *timeout,
 		Logger:   logger,
@@ -221,18 +252,39 @@ func defaultAudience(mode string, u *url.URL) string {
 	return origin + path
 }
 
-// resolveDownstreamAuth resolves env:VAR_NAME indirection so secrets
+// resolveEnvIndirection resolves env:VAR_NAME indirection so secrets
 // don't have to appear in MCP client config files.
-func resolveDownstreamAuth(v string) (string, error) {
+func resolveEnvIndirection(flagName, v string) (string, error) {
 	name, ok := strings.CutPrefix(v, "env:")
 	if !ok {
 		return v, nil
 	}
 	val := os.Getenv(name)
 	if val == "" {
-		return "", fmt.Errorf("--downstream-auth points at env:%s but %s is empty or unset", name, name)
+		return "", fmt.Errorf("%s points at env:%s but %s is empty or unset", flagName, name, name)
 	}
 	return val, nil
+}
+
+// noRedirectClient never follows redirects: a 302 to accounts.google.com
+// is an IAP auth failure signal, not a path to follow.
+func noRedirectClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func splitList(v string) []string {
+	var items []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 // newLogger builds a stderr-only slog logger; stdout is reserved for

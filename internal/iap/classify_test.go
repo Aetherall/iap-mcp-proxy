@@ -35,6 +35,8 @@ func TestIsAuthFailure(t *testing.T) {
 		want bool
 	}{
 		{"401", makeResp(401, nil, ""), true},
+		{"401 from IAP with a challenge", makeResp(401, map[string]string{"X-Goog-Iap-Generated-Response": "true", "WWW-Authenticate": "Bearer"}, ""), true},
+		{"401 application challenge", makeResp(401, map[string]string{"WWW-Authenticate": `Bearer realm="GitLab", resource_metadata="https://gitlab.example.com/.well-known/oauth-protected-resource/api/v4/mcp"`}, ""), false},
 		{"302 to google sign-in", makeResp(302, map[string]string{"Location": "https://accounts.google.com/o/oauth2/v2/auth"}, ""), true},
 		{"302 elsewhere", makeResp(302, map[string]string{"Location": "https://example.com/login"}, ""), false},
 		{"403", makeResp(403, nil, ""), false},
