@@ -21,6 +21,14 @@ go install github.com/knwoop/iap-mcp-proxy/cmd/iap-mcp-proxy@latest
 
 or grab a binary from [Releases](https://github.com/knwoop/iap-mcp-proxy/releases) (darwin/linux/windows, amd64/arm64).
 
+With Nix, this fork (which adds upstream OAuth and sign-in without a browser) is a flake:
+
+```sh
+nix profile install github:Aetherall/iap-mcp-proxy/upstream-oauth
+# or try it without installing
+nix run github:Aetherall/iap-mcp-proxy/upstream-oauth -- --version
+```
+
 ## Quick start
 
 1. Make sure you have credentials IAP will accept (see [Credentials](#credentials)):
