@@ -24,9 +24,9 @@ or grab a binary from [Releases](https://github.com/knwoop/iap-mcp-proxy/release
 With Nix, this fork (which adds upstream OAuth and sign-in without a browser) is a flake:
 
 ```sh
-nix profile install github:Aetherall/iap-mcp-proxy/upstream-oauth
+nix profile install github:Aetherall/iap-mcp-proxy
 # or try it without installing
-nix run github:Aetherall/iap-mcp-proxy/upstream-oauth -- --version
+nix run github:Aetherall/iap-mcp-proxy -- --version
 ```
 
 ## Quick start
